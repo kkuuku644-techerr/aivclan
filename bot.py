@@ -1,342 +1,455 @@
-import json
+import asyncio
+from datetime import datetime, timedelta
 import random
 import sqlite3
-import telebot
-from telebot import types
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command
+from aiogram.types import LabeledPrice, Message
 
-TOKEN = "8935480244:AAH3w6vUIkQTnKD9eSCBL8QiwIDKF7NS4kg"
-CHANNEL_ID = -1004404647295
-ADMIN_CHAT_ID = -1004410094117
-ADMIN_IDS = [7959524856]
+# ТВОИ ДАННЫЕ
+TOKEN = "8983343344:AAFk61fK5vLB7yn1k9OP0MtTAbenRyobBcI"
+ADMIN_ID = 7959524856
 
-REQUIRED_TAGS = ['drt', 'd1rty', 'pig.zip']
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+router = Router()
 
-bot = telebot.TeleBot(TOKEN)
+# БАЗА ДАННЫХ
+conn = sqlite3.connect("database.db")
+cursor = conn.cursor()
 
-def init_db():
-    conn = sqlite3.connect('bot.db')
-    cur = conn.cursor()
-    cur.execute('''CREATE TABLE IF NOT EXISTS users
-                   (user_id INTEGER PRIMARY KEY,
-                    balance INTEGER DEFAULT 1000,
-                    pigs INTEGER DEFAULT 5,
-                    is_vip INTEGER DEFAULT 0,
-                    passport TEXT DEFAULT '')''')
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    balance INTEGER DEFAULT 100,
+    vip_expires TEXT,
+    last_daily TEXT,
+    invited_by INTEGER
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS promos (
+    code TEXT PRIMARY KEY,
+    reward INTEGER
+)
+""")
+conn.commit()
+
+
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+def get_user_data(user_id):
+  cursor.execute(
+      "SELECT balance, vip_expires, last_daily FROM users WHERE user_id = ?",
+      (user_id,),
+  )
+  data = cursor.fetchone()
+  if not data:
+    cursor.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
     conn.commit()
-    conn.close()
+    return 100, None, None
+  return data[0], data[1], data[2]
 
-def get_user(user_id):
-    conn = sqlite3.connect('bot.db')
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    user = cur.fetchone()
-    if not user:
-        cur.execute("INSERT INTO users (user_id, balance, pigs, passport) VALUES (?, ?, ?, ?)", 
-                   (user_id, 1000, 5, ''))
-        conn.commit()
-        cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-        user = cur.fetchone()
-    conn.close()
-    return user
 
-def update_balance(user_id, amount):
-    conn = sqlite3.connect('bot.db')
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
-    conn.commit()
-    conn.close()
+def is_vip(vip_expires):
+  if not vip_expires:
+    return False
+  return datetime.now() < datetime.fromisoformat(vip_expires)
 
-def update_pigs(user_id, amount):
-    conn = sqlite3.connect('bot.db')
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET pigs = pigs + ? WHERE user_id=?", (amount, user_id))
-    conn.commit()
-    conn.close()
 
-def set_passport(user_id, passport_data):
-    conn = sqlite3.connect('bot.db')
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET passport = ? WHERE user_id=?", (json.dumps(passport_data), user_id))
-    conn.commit()
-    conn.close()
+# ЗАЩИТА: Бот автоматически выходит из группы, если его добавил не ты
+@router.my_chat_member()
+async def bot_added_to_chat(event):
+  if event.new_chat_member.status in ["member", "administrator"]:
+    if event.from_user.id != ADMIN_ID:
+      await bot.send_message(
+          event.chat.id,
+          "❌ Этот бот является приватным клановым ботом и может быть добавлен"
+          " только создателем!",
+      )
+      await bot.leave_chat(event.chat.id)
 
-def get_passport(user_id):
-    user = get_user(user_id)
-    if user[4]:
-        return json.loads(user[4])
-    return {}
 
-def get_main_keyboard():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
-    markup.add('🎰 Казино', '💳 Баланс', '📋 Паспорт')
-    markup.add('🐷 Свиньи', '⭐ Купить VIP за звезды', '📤 Предложить слив')
-    return markup
+# --- ПАСПОРТ И ПРОФИЛЬ ---
+@router.message(Command("p"))
+async def cmd_profile(message: Message):
+  user_id = message.from_user.id
+  bal, vip_exp, _ = get_user_data(user_id)
+  status = "👑 Активен" if is_vip(vip_exp) else "❌ Нет"
 
-def get_casino_keyboard():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add('🎲 Кости', '🎰 Слоты')
-    markup.add('💣 Мины', '🔙 Назад')
-    return markup
+  text = (
+      f"🪪 **Паспорт клана Evade**\n\n"
+      f"🆔 ID: `{user_id}`\n"
+      f"🪙 Баланс монеток: `{bal}`\n"
+      f"⭐ VIP Статус: {status}"
+  )
+  await message.answer(text, parse_mode="Markdown")
 
-def get_shop_keyboard():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add('🐷 Купить свинью (500💰)', '💎 Продать свинью (300💰)')
-    markup.add('🔙 Назад')
-    return markup
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    get_user(message.from_user.id)
-    bot.send_message(message.chat.id, "🎰 <b>Добро пожаловать в игровой мир!</b>\nИспользуй кнопки ниже:", parse_mode='HTML', reply_markup=get_main_keyboard())
+@router.message(Command("b"))
+async def cmd_balance(message: Message):
+  bal, _, _ = get_user_data(message.from_user.id)
+  await message.answer(
+      f"🪙 Ваш текущий баланс: `{bal}` монеток", parse_mode="Markdown"
+  )
 
-@bot.message_handler(func=lambda m: m.text == '🔙 Назад')
-def back_to_main(message):
-    bot.send_message(message.chat.id, "Главное меню:", reply_markup=get_main_keyboard())
 
-@bot.message_handler(func=lambda m: m.text == '💳 Баланс')
-def balance_menu(message):
-    user = get_user(message.from_user.id)
-    vip = "👑 Да" if user[3] else "❌ Нет"
-    bot.send_message(message.chat.id, f"💳 <b>Твой профиль:</b>\n💰 Баланс: <code>{user[1]}</code> монет\n🐷 Свиней: <code>{user[2]}</code>\n👑 VIP статус: <code>{vip}</code>", parse_mode='HTML')
+# --- ЕЖЕДНЕВНЫЙ БОНУС ---
+@router.message(Command("daily"))
+async def cmd_daily(message: Message):
+  user_id = message.from_user.id
+  bal, vip_exp, last_daily = get_user_data(user_id)
 
-@bot.message_handler(func=lambda m: m.text == '🎰 Казино')
-def casino_menu(message):
-    bot.send_message(message.chat.id, "🎰 <b>Раздел казино:</b> Выбирай игру:", parse_mode='HTML', reply_markup=get_casino_keyboard())
+  if last_daily:
+    last_time = datetime.fromisoformat(last_daily)
+    if datetime.now() - last_time < timedelta(days=1):
+      timeLeft = timedelta(days=1) - (datetime.now() - last_time)
+      hours = int(timeLeft.total_seconds() // 3600)
+      return await message.answer(
+          f"⏳ Награда уже получена. Ждите еще {hours} ч."
+      )
 
-@bot.message_handler(func=lambda m: m.text == '🎲 Кости')
-def dice_game(message):
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    bet = 50
-    if user[1] < bet:
-        bot.send_message(message.chat.id, "❌ Недостаточно монет!")
-        return
-    update_balance(user_id, -bet)
-    res = random.randint(1, 6)
-    if res >= 4:
-        win = bet * 2
-        update_balance(user_id, win)
-        bot.send_message(message.chat.id, f"🎲 Выпало: {res}\n🎉 Победа! +{win} монет!")
-    else:
-        bot.send_message(message.chat.id, f"🎲 Выпало: {res}\n😢 Проигрыш! -{bet} монет")
+  reward = 100 * (2 if is_vip(vip_exp) else 1)
+  cursor.execute(
+      "UPDATE users SET balance = balance + ?, last_daily = ? WHERE user_id ="
+      " ?",
+      (reward, datetime.now().isoformat(), user_id),
+  )
+  conn.commit()
+  await message.answer(
+      f"🎁 Вы получили ежедневный бонус: `{reward}` монеток!",
+      parse_mode="Markdown",
+  )
 
-@bot.message_handler(func=lambda m: m.text == '🎰 Слоты')
-def slots_game(message):
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    bet = 100
-    if user[1] < bet:
-        bot.send_message(message.chat.id, "❌ Недостаточно монет!")
-        return
-    update_balance(user_id, -bet)
-    symbols = ['🍒', '🍋', '7️⃣', '💎']
-    res = [random.choice(symbols) for _ in range(3)]
-    if res[0] == res[1] == res[2]:
-        win = bet * 5
-        update_balance(user_id, win)
-        text = f"🎰 {' '.join(res)}\n🎉 ДЖЕКПОТ! +{win} монет!"
-    elif res[0] == res[1] or res[1] == res[2]:
-        win = bet * 2
-        update_balance(user_id, win)
-        text = f"🎰 {' '.join(res)}\n🎉 Выигрыш! +{win} монет!"
-    else:
-        text = f"🎰 {' '.join(res)}\n😢 Проигрыш -{bet} монет"
-    bot.send_message(message.chat.id, text)
 
-@bot.message_handler(func=lambda m: m.text == '💣 Мины')
-def mines_game(message):
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    bet = 200
-    if user[1] < bet:
-        bot.send_message(message.chat.id, "❌ Недостаточно монет!")
-        return
-    update_balance(user_id, -bet)
-    markup = types.InlineKeyboardMarkup(row_width=3)
-    for i in range(1, 10):
-        markup.add(types.InlineKeyboardButton(f"📦 Клетка {i}", callback_data=f"mine_{i}_{bet}"))
-    bot.send_message(message.chat.id, f"💣 <b>Мины (Квадрат 3x3)</b>\nСтавка: {bet} монет.\nВыбери безопасную ячейку:", parse_mode='HTML', reply_markup=markup)
+# --- ТОП ИГРОКОВ ---
+@router.message(Command("top"))
+async def cmd_top(message: Message):
+  cursor.execute(
+      "SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 10"
+  )
+  top_users = cursor.fetchall()
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('mine_'))
-def mine_callback(call):
-    _, cell, bet = call.data.split('_')
-    bet = int(bet)
-    win = random.choice([True, False])
-    if win:
-        reward = bet * 2
-        update_balance(call.from_user.id, reward)
-        bot.edit_message_text(f"💣 Клетка #{cell}\n💎 АЛМАЗ! +{reward} монет!", call.message.chat.id, call.message.message_id)
-    else:
-        bot.edit_message_text(f"💣 Клетка #{cell}\n💥 БУХ! Ты подорвался на мине!", call.message.chat.id, call.message.message_id)
-    bot.answer_callback_query(call.id)
+  text = "🏆 **Топ-10 игроков клана:**\n\n"
+  for i, (uid, bal) in enumerate(top_users, 1):
+    text += f"{i}. `ID: {uid}` — 🪙 `{bal}`\n"
 
-@bot.message_handler(func=lambda m: m.text == '📋 Паспорт')
-def passport_menu(message):
-    user_id = message.from_user.id
-    passport = get_passport(user_id)
-    if not passport:
-        passport = {'name': message.from_user.first_name, 'tags': ['drt']}
-        set_passport(user_id, passport)
-    tags = passport.get('tags', [])
-    has_tag = any(t in tags for t in REQUIRED_TAGS)
-    status = "✅ Проверен" if has_tag else "❌ Нет приписки"
-    text = f"""
-📋 <b>ЛИЧНЫЙ ПАСПОРТ ИГРОКА</b>
-━━━━━━━━━━━━━━━━━━━━━
-🆔 ID: <code>{user_id}</code>
-👤 Имя: <code>{passport.get('name')}</code>
-🏷️ Приписки: <code>{', '.join(tags)}</code>
-📌 Статус: <code>{status}</code>
-━━━━━━━━━━━━━━━━━━━━━
-"""
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🏷️ Добавить приписку", callback_data="add_tag_menu"))
-    bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=markup)
+  await message.answer(text, parse_mode="Markdown")
 
-@bot.callback_query_handler(func=lambda call: call.data == "add_tag_menu")
-def add_tag_prompt(call):
-    markup = types.InlineKeyboardMarkup()
-    for tag in REQUIRED_TAGS:
-        markup.add(types.InlineKeyboardButton(f"+ {tag}", callback_data=f"apply_tag_{tag}"))
-    bot.edit_message_text("Выбери приписку для добавления в паспорт:", call.message.chat.id, call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('apply_tag_'))
-def apply_tag(call):
-    tag = call.data.split('_')[2]
-    user_id = call.from_user.id
-    passport = get_passport(user_id)
-    tags = passport.get('tags', [])
-    if tag not in tags:
-        tags.append(tag)
-        passport['tags'] = tags
-        set_passport(user_id, passport)
-    bot.answer_callback_query(call.id, f"Успешно добавлена приписка: {tag}!", show_alert=True)
-    bot.edit_message_text(f"✅ Приписка <b>{tag}</b> добавлена в твой паспорт!", call.message.chat.id, call.message.message_id, parse_mode='HTML')
-
-@bot.message_handler(func=lambda m: m.text == '🐷 Свиньи')
-def pigs_shop(message):
-    user = get_user(message.from_user.id)
-    bot.send_message(message.chat.id, f"🐷 <b>Ферма свиней</b>\nУ тебя свиней: <code>{user[2]}</code>\nБаланс: <code>{user[1]}</code> монет\n", parse_mode='HTML', reply_markup=get_shop_keyboard())
-
-@bot.message_handler(func=lambda m: m.text == '🐷 Купить свинью (500💰)')
-def buy_pig(message):
-    user = get_user(message.from_user.id)
-    if user[1] < 500:
-        bot.send_message(message.chat.id, "❌ Недостаточно монет для покупки свиньи!")
-        return
-    update_balance(message.from_user.id, -500)
-    update_pigs(message.from_user.id, 1)
-    bot.send_message(message.chat.id, "🐷 Ты успешно купил свинью!")
-
-@bot.message_handler(func=lambda m: m.text == '💎 Продать свинью (300💰)')
-def sell_pig(message):
-    user = get_user(message.from_user.id)
-    if user[2] < 1:
-        bot.send_message(message.chat.id, "❌ У тебя нет свиней для продажи!")
-        return
-    update_pigs(message.from_user.id, -1)
-    update_balance(message.from_user.id, 300)
-    bot.send_message(message.chat.id, "💎 Ты продал свинью за 300 монет!")
-
-@bot.message_handler(func=lambda m: m.text == '⭐ Купить VIP за звезды')
-def buy_vip_stars(message):
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("⭐ Оплатить 25 Telegram Stars", callback_data="pay_vip_stars"))
-    bot.send_message(message.chat.id, "👑 <b>Покупка VIP-статуса</b>\nСтоимость: <b>25 ⭐</b>", parse_mode='HTML', reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data == "pay_vip_stars")
-def process_star_payment(call):
-    prices = [types.LabeledPrice(label="VIP статус", amount=25)]
-    bot.send_invoice(
-        chat_id=call.message.chat.id,
-        title="👑 VIP Статус",
-        description="Премиум-статус в боте",
-        invoice_payload="vip_stars",
-        provider_token="",
-        currency="XTR",
-        prices=prices
+# --- ПЕРЕВОД МОНЕТ (/pay) ---
+@router.message(Command("pay"))
+async def cmd_pay(message: Message):
+  args = message.text.split()
+  if len(args) < 3 or not args[1].isdigit() or not args[2].isdigit():
+    return await message.answer(
+        "Использование: `/pay <ID_игрока> <сумма>`", parse_mode="Markdown"
     )
-    bot.answer_callback_query(call.id)
 
-@bot.pre_checkout_query_handler(func=lambda query: True)
-def checkout(pre_checkout_query):
-    bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+  target_id = int(args[1])
+  amount = int(args[2])
 
-@bot.message_handler(content_types=['successful_payment'])
-def got_payment(message):
-    conn = sqlite3.connect('bot.db')
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET is_vip = 1 WHERE user_id=?", (message.from_user.id,))
-    conn.commit()
-    conn.close()
-    bot.send_message(message.chat.id, "🎉 <b>Оплата прошла успешно! Тебе выдан VIP-статус!</b>", parse_mode='HTML')
+  if amount < 5:
+    return await message.answer("❌ Минимальная сумма перевода: 5 монет.")
 
-@bot.message_handler(func=lambda m: m.text == '📤 Предложить слив')
-def propose_slip(message):
-    bot.send_message(message.chat.id, "📤 Отправь следующим сообщением контент (текст, фото, видео) для модерации.")
-    bot.register_next_step_handler(message, forward_to_admin)
+  sender_id = message.from_user.id
+  if sender_id == target_id:
+    return await message.answer("❌ Нельзя переводить монеты самому себе.")
 
-def forward_to_admin(message):
-    user_id = message.from_user.id
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("✅ Подтвердить и слить в канал", callback_data=f"publish_{user_id}"))
-    sent = bot.forward_message(ADMIN_CHAT_ID, message.chat.id, message.message_id)
-    bot.send_message(ADMIN_CHAT_ID, f"📥 Предложка от <code>{user_id}</code>:", parse_mode='HTML', reply_markup=markup, reply_to_message_id=sent.message_id)
-    bot.send_message(message.chat.id, "✅ Отправлено администратору на проверку!")
+  sender_bal, _, _ = get_user_data(sender_id)
+  if sender_bal < amount:
+    return await message.answer("❌ У вас недостаточно монеток.")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('publish_'))
-def publish_slip(call):
-    try:
-        bot.copy_message(CHANNEL_ID, call.message.chat.id, call.message.reply_to_message.message_id)
-        bot.edit_message_text("✅ Успешно опубликовано в канал!", call.message.chat.id, call.message.message_id)
-    except Exception as e:
-        bot.answer_callback_query(call.id, f"Ошибка: {e}", show_alert=True)
-    bot.answer_callback_query(call.id)
+  get_user_data(target_id)  # создаем получателя в базе, если его не было
 
-@bot.message_handler(commands=['admin'])
-def admin_panel(message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("➕ Накрутить монеты по ID", callback_data="adm_add_coins"))
-    markup.add(types.InlineKeyboardButton("🐷 Накрутить свиней по ID", callback_data="adm_add_pigs"))
-    bot.send_message(message.chat.id, "👑 <b>Панель администратора:</b>\nВыбери действие:", parse_mode='HTML', reply_markup=markup)
+  cursor.execute(
+      "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+      (amount, sender_id),
+  )
+  cursor.execute(
+      "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+      (amount, target_id),
+  )
+  conn.commit()
 
-@bot.callback_query_handler(func=lambda call: call.data in ["adm_add_coins", "adm_add_pigs"])
-def adm_action_step(call):
-    if call.from_user.id not in ADMIN_IDS:
-        return
-    action = call.data
-    msg = bot.send_message(call.message.chat.id, "✍️ Введи ID игрока и количество через пробел:\n<i>Пример:</i> <code>7959524856 10000</code>", parse_mode='HTML')
-    if action == "adm_add_coins":
-        bot.register_next_step_handler(msg, process_add_coins)
-    else:
-        bot.register_next_step_handler(msg, process_add_pigs)
-    bot.answer_callback_query(call.id)
+  await message.answer(
+      f"✅ Вы успешно передали `{amount}` монеток игроку `{target_id}`!",
+      parse_mode="Markdown",
+  )
 
-def process_add_coins(message):
-    if message.from_user.id not in ADMIN_IDS: return
-    try:
-        args = message.text.split()
-        target_id, amount = int(args[0]), int(args[1])
-        update_balance(target_id, amount)
-        bot.send_message(message.chat.id, f"✅ Успешно начислено {amount} монет игроку <code>{target_id}</code>!", parse_mode='HTML')
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
 
-def process_add_pigs(message):
-    if message.from_user.id not in ADMIN_IDS: return
-    try:
-        args = message.text.split()
-        target_id, amount = int(args[0]), int(args[1])
-        update_pigs(target_id, amount)
-        bot.send_message(message.chat.id, f"✅ Успешно добавлено {amount} свиней игроку <code>{target_id}</code>!", parse_mode='HTML')
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+# --- ПРОМОКОДЫ ---
+@router.message(Command("addpromo"))
+async def cmd_addpromo(message: Message):
+  if message.from_user.id != ADMIN_ID:
+    return
+  args = message.text.split()
+  if len(args) < 3:
+    return await message.answer("Использование: `/addpromo <код> <награда>`")
+  cursor.execute(
+      "INSERT OR REPLACE INTO promos (code, reward) VALUES (?, ?)",
+      (args[1], int(args[2])),
+  )
+  conn.commit()
+  await message.answer(f"✅ Промокод `{args[1]}` создан!", parse_mode="Markdown")
+
+
+@router.message(Command("promo"))
+async def cmd_promo(message: Message):
+  args = message.text.split()
+  if len(args) < 2:
+    return await message.answer("Использование: `/promo <код>`")
+  code = args[1]
+
+  cursor.execute("SELECT reward FROM promos WHERE code = ?", (code,))
+  res = cursor.fetchone()
+  if not res:
+    return await message.answer("❌ Промокод не найден или устарел.")
+
+  reward = res[0]
+  user_id = message.from_user.id
+  cursor.execute(
+      "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+      (reward, user_id),
+  )
+  cursor.execute("DELETE FROM promos WHERE code = ?", (code,))
+  conn.commit()
+  await message.answer(
+      f"🎉 Промокод активирован! Вы получили `{reward}` монеток!",
+      parse_mode="Markdown",
+  )
+
+
+# --- РЕФЕРАЛЬНАЯ СИСТЕМА ---
+@router.message(Command("ref"))
+async def cmd_ref(message: Message):
+  user_id = message.from_user.id
+  bot_info = await bot.get_me()
+  link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
+  await message.answer(
+      f"🔗 Ваша реферальная ссылка:\n`{link}`\n\nПриглашайте друзей и получайте"
+      " бонусы!",
+      parse_mode="Markdown",
+  )
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+  args = message.text.split()
+  user_id = message.from_user.id
+  get_user_data(user_id)
+
+  if len(args) > 1 and args[1].startswith("ref_"):
+    ref_id = int(args[1].split("_")[1])
+    if ref_id != user_id:
+      cursor.execute(
+          "SELECT invited_by FROM users WHERE user_id = ?", (user_id,)
+      )
+      res = cursor.fetchone()
+      if res and not res[0]:
+        cursor.execute(
+            "UPDATE users SET invited_by = ? WHERE user_id = ?",
+            (ref_id, user_id),
+        )
+        cursor.execute(
+            "UPDATE users SET balance = balance + 50 WHERE user_id = ?",
+            (ref_id,),
+        )
+        cursor.execute(
+            "UPDATE users SET balance = balance + 50 WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.commit()
+        await message.answer(
+            "🎁 Вы активировали реферальную ссылку и получили 50 монет!"
+        )
+
+  await message.answer(
+      "👋 Добро пожаловать в клановый бот **Evade**!\nИспользуйте /p для"
+      " просмотра паспорта и /caz для списка игр.",
+      parse_mode="Markdown",
+  )
+
+
+# --- ПОКУПКА МОНЕТ И VIP ЗА ЗВЕЗДЫ ---
+@router.message(Command("buy_coins"))
+async def buy_coins(message: Message):
+  args = message.text.split()
+  if len(args) < 2 or not args[1].isdigit():
+    return await message.answer("Использование: `/buy_coins <количество>`")
+  amount = int(args[1])
+  await message.answer_invoice(
+      title="Покупка монет Evade",
+      description=f"Покупка {amount} монеток (1 звезда = 1 монета)",
+      prices=[LabeledPrice(label="Монетки", amount=amount)],
+      payload=f"buy_coins_{amount}",
+      currency="XTR",
+  )
+
+
+@router.message(Command("buy_vip"))
+async def buy_vip(message: Message):
+  await message.answer_invoice(
+      title="VIP Статус на 30 дней",
+      description=(
+          "Преимущества VIP: x2 к монетам во всех играх и +15% к удаче в минах!"
+      ),
+      prices=[LabeledPrice(label="VIP", amount=25)],
+      payload="buy_vip_30",
+      currency="XTR",
+  )
+
+
+@router.pre_checkout_query()
+async def pre_checkout(q):
+  await bot.answer_pre_checkout_query(q.id, ok=True)
+
+
+@router.message(F.successful_payment)
+async def success_pay(message: Message):
+  payload = message.successful_payment.invoice_payload
+  user_id = message.from_user.id
+  if payload.startswith("buy_coins_"):
+    count = int(payload.split("_")[2])
+    cursor.execute(
+        "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+        (count, user_id),
+    )
+  elif payload == "buy_vip_30":
+    exp = (datetime.now() + timedelta(days=30)).isoformat()
+    cursor.execute(
+        "UPDATE users SET vip_expires = ? WHERE user_id = ?", (exp, user_id)
+    )
+  conn.commit()
+  await message.answer("✅ Успешная покупка! Спасибо за поддержку.")
+
+
+# --- КАЗИНО И ИГРЫ ---
+@router.message(Command("caz"))
+async def cmd_caz(message: Message):
+  await message.answer(
+      "🎰 **Казино клана Evade**\n\n/slots <ставка> — Слоты\n/dice <ставка> —"
+      " Кубик\n/mines <ставка> — Мины\n\n⚡️ Минимальная ставка: `5` монет",
+      parse_mode="Markdown",
+  )
+
+
+@router.message(Command("slots"))
+async def play_slots(message: Message):
+  args = message.text.split()
+  if len(args) < 2 or not args[1].isdigit() or int(args[1]) < 5:
+    return await message.answer(
+        "❌ Минимальная ставка: `/slots <ставка от 5>`", parse_mode="Markdown"
+    )
+  bet = int(args[1])
+
+  bal, vip_exp, _ = get_user_data(message.from_user.id)
+  if bal < bet:
+    return await message.answer("❌ Недостаточно монеток на балансе!")
+
+  cursor.execute(
+      "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+      (bet, message.from_user.id),
+  )
+  msg = await message.answer_dice("🎰")
+  await asyncio.sleep(2.5)
+
+  if msg.dice.value in [1, 22, 43, 64]:
+    win = (bet * 5) * (2 if is_vip(vip_exp) else 1)
+    cursor.execute(
+        "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+        (win, message.from_user.id),
+    )
+    await message.answer(
+        f"🎉 **ДЖЕКПОТ!** Вы выиграли `{win}` монеток!", parse_mode="Markdown"
+    )
+  else:
+    await message.answer("😢 К сожалению, вы проиграли ставку.")
+  conn.commit()
+
+
+@router.message(Command("dice"))
+async def play_dice(message: Message):
+  args = message.text.split()
+  if len(args) < 2 or not args[1].isdigit() or int(args[1]) < 5:
+    return await message.answer(
+        "❌ Минимальная ставка: `/dice <ставка от 5>`", parse_mode="Markdown"
+    )
+  bet = int(args[1])
+
+  bal, vip_exp, _ = get_user_data(message.from_user.id)
+  if bal < bet:
+    return await message.answer("❌ Недостаточно монеток!")
+
+  cursor.execute(
+      "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+      (bet, message.from_user.id),
+  )
+  msg = await message.answer_dice("🎲")
+  await asyncio.sleep(3)
+
+  if msg.dice.value >= 4:
+    win = (bet * 2) * (2 if is_vip(vip_exp) else 1)
+    cursor.execute(
+        "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+        (win, message.from_user.id),
+    )
+    await message.answer(
+        f"🎯 Выброшено {msg.dice.value}! Победа, вы выиграли `{win}` монеток!",
+        parse_mode="Markdown",
+    )
+  else:
+    await message.answer(f"😢 Выброшено {msg.dice.value}. Поражение.")
+  conn.commit()
+
+
+@router.message(Command("mines"))
+async def play_mines(message: Message):
+  args = message.text.split()
+  if len(args) < 2 or not args[1].isdigit() or int(args[1]) < 5:
+    return await message.answer(
+        "❌ Минимальная ставка: `/mines <ставка от 5>`", parse_mode="Markdown"
+    )
+  bet = int(args[1])
+
+  bal, vip_exp, _ = get_user_data(message.from_user.id)
+  if bal < bet:
+    return await message.answer("❌ Недостаточно монеток!")
+
+  # Шанс бомбы базовый 25%, для ВИП снижаем на 15%
+  chance = 0.25
+  if is_vip(vip_exp):
+    chance -= 0.15
+
+  cursor.execute(
+      "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+      (bet, message.from_user.id),
+  )
+
+  if random.random() > chance:
+    win = int(bet * 2) * (2 if is_vip(vip_exp) else 1)
+    cursor.execute(
+        "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+        (win, message.from_user.id),
+    )
+    await message.answer(
+        f"💰 **Успех!** Поле пройдено. Выигрыш: `{win}` монеток!",
+        parse_mode="Markdown",
+    )
+  else:
+    await message.answer(
+        "💥 **БУХ!** Вы нарвались на мину и потеряли ставку.",
+        parse_mode="Markdown",
+    )
+  conn.commit()
+
+
+async def main():
+  dp.include_router(router)
+  await bot.delete_webhook(drop_pending_updates=True)
+  await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
-    init_db()
-    print("Бот полностью запущен и готов к работе!")
-    bot.infinity_polling()
+  asyncio.run(main())
 
